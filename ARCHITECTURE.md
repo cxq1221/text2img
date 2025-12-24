@@ -168,7 +168,7 @@
 ## 📁 目录结构
 
 ```
-text2img-demo/
+text2img/                       #业务项目目录
 ├── backend/                    # 后端目录
 │   ├── main.py                # FastAPI 后端主文件
 │   └── z-image_base.json      # ComfyUI workflow（API 格式）
@@ -177,8 +177,8 @@ text2img-demo/
 │   └── index.html             # 原生 HTML + JavaScript 页面
 │
 ├── requirements.txt           # Python 依赖列表
-├── README.md                  # 项目说明（简要）
-└── ARCHITECTURE.md            # 本文档（架构与功能说明）
+└── README.md                  # 项目说明
+
 ```
 
 ### 文件说明
@@ -386,7 +386,7 @@ ws://{host}:8188/ws?clientId={client_id}
 
 1. **安装 Python 依赖**：
    ```bash
-   cd /root/text2img-demo
+   cd text2img
    pip install -r requirements.txt
    ```
 
@@ -439,7 +439,7 @@ ws://{host}:8188/ws?clientId={client_id}
 
 **启动后端**：
 ```bash
-cd /root/text2img-demo
+cd text2img
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -470,7 +470,7 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
 1. **构建镜像**（假设已有 Dockerfile）：
    ```bash
-   docker build -t text2img-demo .
+   docker build -t text2img .
    ```
 
 2. **运行容器**（只需映射 8000 端口，后端同时托管前端）：
@@ -478,7 +478,7 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
    docker run -d \
      -p 8000:8000 \
      --network host \
-     text2img-demo
+     text2img
    ```
 
 3. **访问**：`http://{容器IP}:8000/`
