@@ -2,7 +2,6 @@
 
 这是一个**教程级文生图应用**项目，用于演示如何通过 FastAPI 后端和原生 HTML/JavaScript 前端，与 ComfyUI 进行集成，实现文本生成图片的完整流程。
 ## 🚀 使用说明
-详情可参考 ./ARCHITECTURE.md
 ### 前置条件
 
 1. **ComfyUI 已安装并运行**（默认端口 8188）
@@ -13,7 +12,6 @@
 
 1. **安装 Python 依赖**：
    ```bash
-   cd text2img
    pip install -r requirements.txt
    ```
 
@@ -30,3 +28,6 @@
    - 直接在浏览器访问：`http://{服务器IP}:8000/`
    - 根路径会自动重定向到前端页面
    - 前端页面由后端通过 `/static` 路径提供
+
+
+详细架构说明可参考 ./ARCHITECTURE.md
