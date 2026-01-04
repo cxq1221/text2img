@@ -9,6 +9,7 @@ import json
 import uuid
 import copy
 import asyncio
+import threading
 from pathlib import Path
 from typing import Dict
 import websockets
@@ -36,6 +37,12 @@ def index():
 # Worker注册表
 workers: Dict[str, dict] = {}
 
+# 记录prompt_id到worker_id的映射（用于WebSocket路由）
+prompt_to_worker: Dict[str, str] = {}
+
+# 调度锁，确保调度操作的原子性
+SCHEDULER_LOCK = threading.Lock()
+
 MAX_TASK_TIME = 120  # 任务最大执行时间（秒）
 HEARTBEAT_TIMEOUT = 15  # 心跳超时时间（秒）
 
@@ -45,6 +52,10 @@ COMFYUI_WS_URL = "ws://127.0.0.1:8188/ws"
 
 class HeartbeatRequest(BaseModel):
     worker_id: str
+
+class CompleteRequest(BaseModel):
+    worker_id: str
+    prompt_id: str
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -76,9 +87,17 @@ def replace_prompt_in_workflow(workflow: dict, prompt: str) -> dict:
 def is_worker_available(worker_info: dict) -> bool:
     """判断Worker是否可用"""
     now = time.time()
-    if now - worker_info.get('last_heartbeat', 0) > HEARTBEAT_TIMEOUT:
+    last_heartbeat = worker_info.get('last_heartbeat', 0)
+    busy = worker_info.get('busy', False)
+    busy_until = worker_info.get('busy_until', 0)
+    
+    # 心跳超时
+    if now - last_heartbeat > HEARTBEAT_TIMEOUT:
         return False
-    if now <= worker_info.get('busy_until', 0):
+    if busy:
+        return False
+    # 任务超时（双重保护，即使busy标记失效，时间戳也能保护）
+    if now <= busy_until:
         return False
     return True
 
@@ -105,12 +124,40 @@ def heartbeat(req: HeartbeatRequest):
         
         workers[worker_id] = {
             'last_heartbeat': now,
+            'busy': False,
             'busy_until': 0,
             'url': worker_url
         }
     else:
         workers[worker_id]['last_heartbeat'] = now
+        # 如果busy_until已过期，自动重置busy状态
+        if now > workers[worker_id].get('busy_until', 0):
+            workers[worker_id]['busy'] = False
+
+    print(f"Worker心跳时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}")
+    print(f"Worker心跳信息: {workers}")
+    return {"status": "ok"}
+
+@app.post("/complete")
+def complete(req: CompleteRequest):
+    """接收Worker任务完成通知"""
+    worker_id = req.worker_id
+    prompt_id = req.prompt_id
     
+    if worker_id not in workers:
+        return {"status": "error", "detail": "Worker not found"}
+    
+    worker_info = workers[worker_id]
+    
+    # 立即释放worker
+    worker_info['busy'] = False
+    worker_info['busy_until'] = 0
+    
+    # 清理prompt_id映射（可选）
+    if prompt_id in prompt_to_worker:
+        del prompt_to_worker[prompt_id]
+    
+    print(f"Worker {worker_id} 任务完成 (prompt_id={prompt_id})，已释放")
     return {"status": "ok"}
 
 @app.post("/generate")
@@ -125,13 +172,22 @@ def generate(req: GenerateRequest):
     
     client_id = str(uuid.uuid4())
     
-    # 如果有可用Worker，调度到Worker
-    available_worker = get_available_worker()
-    if available_worker:
-        worker_id, worker_info = available_worker
-        now = time.time()
-        worker_info['busy_until'] = now + MAX_TASK_TIME
-        
+    # 使用锁确保调度操作的原子性
+    with SCHEDULER_LOCK:
+        # 如果有可用Worker，调度到Worker
+        available_worker = get_available_worker()
+        if available_worker:
+            worker_id, worker_info = available_worker
+            now = time.time()
+            busy_until_time = now + MAX_TASK_TIME
+            worker_info['busy'] = True
+            worker_info['busy_until'] = busy_until_time
+            print(f"分配任务到Worker {worker_id}, busy=True, busy_until={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(busy_until_time))}")
+        else:
+            worker_id = None
+            worker_info = None
+    
+    if worker_id and worker_info:
         try:
             worker_url = worker_info['url']
             payload = {
@@ -141,17 +197,30 @@ def generate(req: GenerateRequest):
             response = requests.post(f"{worker_url}/run", json=payload, timeout=5)
             response.raise_for_status()
             result = response.json()
+            prompt_id = result.get("prompt_id")
             
+            # 记录prompt_id到worker_id的映射
+            if prompt_id:
+                prompt_to_worker[prompt_id] = worker_id
+            
+            print(f"Worker {worker_id} 任务提交成功, prompt_id={prompt_id}")
             return {
                 "worker_id": worker_id,
-                "prompt_id": result.get("prompt_id"),
+                "prompt_id": prompt_id,
                 "client_id": client_id
             }
         except Exception as e:
+            worker_info['busy'] = False
             worker_info['busy_until'] = 0
+            print(f"Worker {worker_id} 任务失败，释放Worker: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
     
-    # 没有Worker，直接调用本机ComfyUI
+    # 有Worker注册但都在忙碌
+    if workers:
+        print(f"所有Worker都在忙碌，Worker状态: {[(wid, {'busy_until': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(w.get('busy_until', 0))), 'last_heartbeat': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(w.get('last_heartbeat', 0)))}) for wid, w in workers.items()]}")
+        raise HTTPException(status_code=503, detail="当前没有空闲机器，请稍后再试")
+    
+    # 完全没有Worker，直接调用本机ComfyUI
     try:
         url = f"{COMFYUI_API_URL}/prompt"
         payload = {
@@ -224,13 +293,30 @@ def get_image(filename: str, subfolder: str = "", type: str = "output"):
 
 @app.websocket("/ws")
 async def websocket_proxy(websocket: WebSocket):
-    """WebSocket代理，转发到ComfyUI"""
+    """WebSocket代理，转发到ComfyUI或Worker的ComfyUI"""
     await websocket.accept()
     
     query_params = dict(websocket.query_params)
     client_id = query_params.get("clientId", str(uuid.uuid4()))
+    prompt_id = query_params.get("promptId", "")
     
-    comfyui_ws_url = f"{COMFYUI_WS_URL}?clientId={client_id}"
+    # 根据prompt_id找到对应的worker_id
+    worker_id = None
+    if prompt_id and prompt_id in prompt_to_worker:
+        worker_id = prompt_to_worker[prompt_id]
+        worker_info = workers.get(worker_id)
+        if worker_info:
+            # 连接到Worker的ComfyUI WebSocket
+            worker_ip = worker_id if worker_id not in ['127.0.0.1', 'localhost'] else '127.0.0.1'
+            comfyui_ws_url = f"ws://{worker_ip}:8188/ws?clientId={client_id}"
+        else:
+            # Worker不存在，使用本机ComfyUI
+            comfyui_ws_url = f"{COMFYUI_WS_URL}?clientId={client_id}"
+    else:
+        # 没有prompt_id或找不到映射，使用本机ComfyUI
+        comfyui_ws_url = f"{COMFYUI_WS_URL}?clientId={client_id}"
+    
+    print(f"WebSocket代理: prompt_id={prompt_id}, worker_id={worker_id}, ws_url={comfyui_ws_url}")
     comfyui_ws = None
     
     try:

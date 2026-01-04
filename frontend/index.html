@@ -571,8 +571,28 @@
             });
 
             if (!resp.ok) {
-                const text = await resp.text();
-                throw new Error("调用后端 /generate 失败: " + text);
+                let errorMsg = "调用后端 /generate 失败";
+                try {
+                    const errorData = await resp.json();
+                    if (errorData.detail) {
+                        errorMsg = errorData.detail;
+                    }
+                } catch (e) {
+                    const text = await resp.text();
+                    if (text) {
+                        errorMsg = text;
+                    }
+                }
+                // 503错误表示服务不可用（没有空闲机器）
+                if (resp.status === 503) {
+                    errorMsg = "当前没有空闲机器，请稍后再试";
+                }
+                const error = new Error(errorMsg);
+                // 标记503错误，方便上层处理
+                if (resp.status === 503) {
+                    error.is503 = true;
+                }
+                throw error;
             }
 
             const data = await resp.json();
@@ -580,18 +600,37 @@
         }
 
         // 连接 WebSocket（通过后端代理）
-        function connectWebSocket(clientId) {
+        let wsTimeoutTimer = null;
+        let hasReceivedMessage = false;
+        
+        function connectWebSocket(clientId, promptId) {
             // 通过后端代理连接，不直接连接 ComfyUI
-            const wsUrl = `${WS_BASE_URL}/ws?clientId=${encodeURIComponent(clientId)}`;
+            // 传递promptId以便Scheduler路由到正确的Worker
+            const wsUrl = `${WS_BASE_URL}/ws?clientId=${encodeURIComponent(clientId)}&promptId=${encodeURIComponent(promptId || '')}`;
             appendLog("连接 WebSocket（通过后端代理）: " + wsUrl);
             ws = new WebSocket(wsUrl);
+            hasReceivedMessage = false;
 
             ws.onopen = () => {
                 appendLog("WebSocket 已连接");
                 setStatus("已连接 WebSocket，等待生成进度...");
+                
+                // 设置超时检测：30秒内没有收到任何消息，提示超时
+                wsTimeoutTimer = setTimeout(() => {
+                    if (!hasReceivedMessage) {
+                        setStatus("等待超时：未收到生成进度，请检查任务是否已开始");
+                        appendLog("警告：WebSocket 连接后30秒内未收到任何消息");
+                    }
+                }, 30000);
             };
 
             ws.onmessage = (event) => {
+                hasReceivedMessage = true;
+                if (wsTimeoutTimer) {
+                    clearTimeout(wsTimeoutTimer);
+                    wsTimeoutTimer = null;
+                }
+                
                 try {
                     const data = JSON.parse(event.data);
                     handleWsMessage(data);
@@ -603,10 +642,23 @@
             ws.onerror = (event) => {
                 appendLog("WebSocket 错误");
                 console.error(event);
+                setStatus("WebSocket 连接错误，请检查网络连接");
+                if (wsTimeoutTimer) {
+                    clearTimeout(wsTimeoutTimer);
+                    wsTimeoutTimer = null;
+                }
             };
 
             ws.onclose = () => {
                 appendLog("WebSocket 已关闭");
+                if (wsTimeoutTimer) {
+                    clearTimeout(wsTimeoutTimer);
+                    wsTimeoutTimer = null;
+                }
+                // 如果关闭时还没有收到完成消息，可能是连接异常
+                if (!hasReceivedMessage) {
+                    setStatus("WebSocket 连接已关闭，任务可能未正常完成");
+                }
             };
         }
 
@@ -739,14 +791,24 @@
 
             try {
                 const { prompt_id, client_id } = await callBackendGenerate(prompt);
+                
+                if (!prompt_id) {
+                    throw new Error("后端未返回有效的 prompt_id");
+                }
+                
                 currentPromptId = prompt_id;
                 currentClientId = client_id;
                 appendLog("后端返回 prompt_id=" + prompt_id + ", client_id=" + client_id);
 
-                connectWebSocket(client_id);
+                connectWebSocket(client_id, prompt_id);
             } catch (err) {
                 console.error(err);
-                setStatus("生成请求失败: " + err.message);
+                // 如果是503错误（没有空闲机器），直接显示错误信息，不加前缀
+                if (err.is503 || err.message.includes("没有空闲机器")) {
+                    setStatus(err.message);
+                } else {
+                    setStatus("生成请求失败: " + err.message);
+                }
                 generateBtn.disabled = false;
                 generateText.textContent = "生成图片";
             }
