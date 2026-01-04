@@ -10,6 +10,7 @@ import uuid
 import copy
 import asyncio
 import threading
+import random
 from pathlib import Path
 from typing import Dict
 import websockets
@@ -68,8 +69,11 @@ def load_workflow() -> dict:
         return json.load(f)
 
 def replace_prompt_in_workflow(workflow: dict, prompt: str) -> dict:
-    """替换workflow中的prompt"""
+    """替换workflow中的prompt，并更新随机种子确保每次都是新任务"""
     wf = copy.deepcopy(workflow)
+    
+    # 找到并替换prompt
+    prompt_found = False
     for node_id, node in wf.items():
         if not isinstance(node, dict):
             continue
@@ -81,8 +85,24 @@ def replace_prompt_in_workflow(workflow: dict, prompt: str) -> dict:
             inputs = node.get("inputs")
             if isinstance(inputs, dict) and "text" in inputs:
                 inputs["text"] = prompt
-                return wf
-    raise ValueError("未找到正向CLIPTextEncode节点")
+                prompt_found = True
+                break
+    
+    if not prompt_found:
+        raise ValueError("未找到正向CLIPTextEncode节点")
+    
+    # 找到KSampler节点，更新随机种子
+    for node_id, node in wf.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") == "KSampler":
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and "seed" in inputs:
+                # 生成随机种子，确保每次都是新任务
+                inputs["seed"] = random.randint(0, 2**32 - 1)
+                break
+    
+    return wf
 
 def is_worker_available(worker_info: dict) -> bool:
     """判断Worker是否可用"""
