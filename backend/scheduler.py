@@ -234,6 +234,9 @@ def generate(req: GenerateRequest):
         if not prompt_id:
             raise HTTPException(status_code=500, detail="ComfyUI 响应中未包含 prompt_id")
         
+        # 记录prompt_id映射，使用特殊标记表示本机ComfyUI
+        prompt_to_worker[prompt_id] = "localhost"
+        
         return {
             "prompt_id": prompt_id,
             "client_id": client_id
@@ -244,18 +247,20 @@ def generate(req: GenerateRequest):
 @app.get("/history/{prompt_id}")
 def get_history(prompt_id: str):
     """转发到Worker或ComfyUI的/history接口"""
-    available_worker = get_available_worker()
-    if available_worker:
-        worker_id, worker_info = available_worker
+    # 根据prompt_id找到对应的worker_id
+    worker_id = prompt_to_worker.get(prompt_id)
+    if worker_id and worker_id in workers:
+        worker_info = workers[worker_id]
         worker_url = worker_info['url']
         try:
             response = requests.get(f"{worker_url}/history/{prompt_id}", timeout=5)
             response.raise_for_status()
             return JSONResponse(content=response.json())
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            # 如果Worker查询失败，fallback到本机ComfyUI
+            print(f"Worker {worker_id} 查询历史失败，fallback到本机ComfyUI: {str(e)}")
     
-    # 没有Worker，直接调用本机ComfyUI
+    # 没有找到对应的Worker或Worker查询失败，直接调用本机ComfyUI
     url = f"{COMFYUI_API_URL}/history/{prompt_id}"
     try:
         resp = requests.get(url, timeout=5)
@@ -265,11 +270,15 @@ def get_history(prompt_id: str):
         raise HTTPException(status_code=500, detail=f"ComfyUI error: {str(e)}")
 
 @app.get("/image")
-def get_image(filename: str, subfolder: str = "", type: str = "output"):
+def get_image(filename: str, subfolder: str = "", type: str = "output", prompt_id: str = ""):
     """转发到Worker或ComfyUI的/image接口"""
-    available_worker = get_available_worker()
-    if available_worker:
-        worker_id, worker_info = available_worker
+    # 如果提供了prompt_id，根据prompt_id找到对应的worker_id
+    worker_id = None
+    if prompt_id and prompt_id in prompt_to_worker:
+        worker_id = prompt_to_worker[prompt_id]
+    
+    if worker_id and worker_id in workers:
+        worker_info = workers[worker_id]
         worker_url = worker_info['url']
         try:
             params = {"filename": filename, "subfolder": subfolder, "type": type}
@@ -278,9 +287,10 @@ def get_image(filename: str, subfolder: str = "", type: str = "output"):
             content_type = response.headers.get("Content-Type", "image/png")
             return StreamingResponse(response.raw, media_type=content_type)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            # 如果Worker查询失败，fallback到本机ComfyUI
+            print(f"Worker {worker_id} 查询图像失败，fallback到本机ComfyUI: {str(e)}")
     
-    # 没有Worker，直接调用本机ComfyUI
+    # 没有找到对应的Worker或Worker查询失败，直接调用本机ComfyUI
     params = {"filename": filename, "subfolder": subfolder, "type": type}
     url = f"{COMFYUI_API_URL}/view"
     try:
