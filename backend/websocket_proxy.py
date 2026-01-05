@@ -35,21 +35,31 @@ class WebSocketProxy:
                 try:
                     while True:
                         message = await comfyui_ws.recv()
-                        await websocket.send_text(message)
+                        try:
+                            await websocket.send_text(message)
+                        except (RuntimeError, ConnectionError) as e:
+                            # WebSocket已关闭，停止转发
+                            break
                 except websockets.exceptions.ConnectionClosed:
                     pass
                 except Exception as e:
-                    print(f"转发到客户端错误: {e}")
+                    # 忽略已关闭的连接错误
+                    pass
             
             async def forward_to_comfyui():
                 try:
                     while True:
                         message = await websocket.receive_text()
-                        await comfyui_ws.send(message)
+                        try:
+                            await comfyui_ws.send(message)
+                        except (websockets.exceptions.ConnectionClosed, ConnectionError) as e:
+                            # ComfyUI WebSocket已关闭，停止转发
+                            break
                 except WebSocketDisconnect:
                     pass
                 except Exception as e:
-                    print(f"转发到ComfyUI错误: {e}")
+                    # 忽略已关闭的连接错误
+                    pass
             
             await asyncio.gather(
                 forward_to_client(),

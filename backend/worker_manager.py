@@ -8,6 +8,7 @@ class WorkerManager:
     def __init__(self, max_task_time: int = 120, heartbeat_timeout: int = 15):
         self.workers: Dict[str, dict] = {}
         self.prompt_to_worker: Dict[str, str] = {}
+        self.prompt_cleanup_time: Dict[str, float] = {}  # 记录prompt_id的清理时间
         self.lock = threading.Lock()
         self.max_task_time = max_task_time
         self.heartbeat_timeout = heartbeat_timeout
@@ -85,9 +86,22 @@ class WorkerManager:
         worker_info['busy'] = False
         worker_info['busy_until'] = 0
         
-        # 清理prompt_id映射
+        # 延迟清理prompt_id映射（30秒后清理，确保前端有足够时间获取图片）
         if prompt_id and prompt_id in self.prompt_to_worker:
-            del self.prompt_to_worker[prompt_id]
+            self.prompt_cleanup_time[prompt_id] = time.time() + 30
+            # 启动清理线程
+            def cleanup_later():
+                time.sleep(30)
+                if prompt_id in self.prompt_cleanup_time:
+                    cleanup_time = self.prompt_cleanup_time.get(prompt_id, 0)
+                    if time.time() >= cleanup_time:
+                        if prompt_id in self.prompt_to_worker:
+                            del self.prompt_to_worker[prompt_id]
+                        if prompt_id in self.prompt_cleanup_time:
+                            del self.prompt_cleanup_time[prompt_id]
+            
+            cleanup_thread = threading.Thread(target=cleanup_later, daemon=True)
+            cleanup_thread.start()
     
     def map_prompt_to_worker(self, prompt_id: str, worker_id: str):
         """记录prompt_id到worker_id的映射"""

@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 import uuid
@@ -10,11 +10,9 @@ from pathlib import Path
 try:
     from .worker_manager import WorkerManager
     from .workflow_handler import WorkflowHandler
-    from .websocket_proxy import WebSocketProxy
 except ImportError:
     from worker_manager import WorkerManager
     from workflow_handler import WorkflowHandler
-    from websocket_proxy import WebSocketProxy
 
 app = FastAPI()
 
@@ -41,7 +39,6 @@ WORKFLOW_FILE = Path(__file__).parent / "z-image_base.json"
 
 worker_manager = WorkerManager(max_task_time=120, heartbeat_timeout=15)
 workflow_handler = WorkflowHandler(WORKFLOW_FILE)
-ws_proxy = WebSocketProxy()
 
 # 请求模型
 class HeartbeatRequest(BaseModel):
@@ -112,6 +109,7 @@ def generate(req: GenerateRequest):
             print(f"Worker {worker_id} 任务提交成功, prompt_id={prompt_id}")
             return {
                 "worker_id": worker_id,
+                "worker_url": worker_url,
                 "prompt_id": prompt_id,
                 "client_id": client_id
             }
@@ -123,9 +121,9 @@ def generate(req: GenerateRequest):
     # 没有可用Worker
     raise HTTPException(status_code=503, detail="当前没有空闲机器，请稍后再试")
 
-@app.get("/history/{prompt_id}")
-def get_history(prompt_id: str):
-    """转发到Worker的/history接口"""
+@app.get("/status/{prompt_id}")
+def get_status(prompt_id: str):
+    """获取任务状态和进度（转发到Worker）"""
     worker_id = worker_manager.get_worker_by_prompt(prompt_id)
     if not worker_id or worker_id not in worker_manager.workers:
         raise HTTPException(status_code=404, detail="未找到对应的Worker")
@@ -133,47 +131,44 @@ def get_history(prompt_id: str):
     worker_info = worker_manager.workers[worker_id]
     worker_url = worker_info['url']
     try:
-        response = requests.get(f"{worker_url}/history/{prompt_id}", timeout=5)
+        response = requests.get(f"{worker_url}/status/{prompt_id}", timeout=5)
         response.raise_for_status()
         return JSONResponse(content=response.json())
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
 
-@app.get("/image")
-def get_image(filename: str, subfolder: str = "", type: str = "output", prompt_id: str = ""):
-    """转发到Worker的/image接口"""
-    worker_id = None
-    if prompt_id:
-        worker_id = worker_manager.get_worker_by_prompt(prompt_id)
-    
+@app.get("/result/{prompt_id}")
+def get_result(prompt_id: str):
+    """获取任务结果（转发到Worker）"""
+    worker_id = worker_manager.get_worker_by_prompt(prompt_id)
     if not worker_id or worker_id not in worker_manager.workers:
         raise HTTPException(status_code=404, detail="未找到对应的Worker")
     
     worker_info = worker_manager.workers[worker_id]
     worker_url = worker_info['url']
     try:
-        params = {"filename": filename, "subfolder": subfolder, "type": type}
-        response = requests.get(f"{worker_url}/image", params=params, stream=True, timeout=5)
+        response = requests.get(f"{worker_url}/result/{prompt_id}", timeout=5)
         response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "image/png")
-        return StreamingResponse(response.raw, media_type=content_type)
+        return JSONResponse(content=response.json())
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if e.response.status_code == 400:
+            # Worker返回400表示任务未完成，返回状态信息
+            try:
+                status_response = requests.get(f"{worker_url}/status/{prompt_id}", timeout=5)
+                if status_response.status_code == 200:
+                    return JSONResponse(content=status_response.json())
+            except:
+                pass
+            raise HTTPException(status_code=400, detail="任务尚未完成")
+        raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
-
-@app.websocket("/ws")
-async def websocket_proxy(websocket: WebSocket):
-    """WebSocket代理，转发到Worker的ComfyUI"""
-    query_params = dict(websocket.query_params)
-    client_id = query_params.get("clientId", str(uuid.uuid4()))
-    prompt_id = query_params.get("promptId", "")
-    
-    # 根据prompt_id找到对应的worker_id
-    worker_id = None
-    if prompt_id:
-        worker_id = worker_manager.get_worker_by_prompt(prompt_id)
-    
-    print(f"WebSocket代理: prompt_id={prompt_id}, worker_id={worker_id}")
-    await ws_proxy.proxy(websocket, client_id, worker_id, worker_manager.workers)
 
 if __name__ == "__main__":
     import uvicorn

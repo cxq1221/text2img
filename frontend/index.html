@@ -436,8 +436,6 @@
         // 注意：如果使用了端口映射，window.location.port 会是映射后的端口
         const CURRENT_PORT = window.location.port || '8000';
         const BACKEND_BASE_URL = `http://${CURRENT_HOST}:${CURRENT_PORT}`;
-        // WebSocket 也通过后端代理，不再直接连接 ComfyUI
-        const WS_BASE_URL = `ws://${CURRENT_HOST}:${CURRENT_PORT}`;
 
         // DOM 元素
         const promptInput = document.getElementById("prompt");
@@ -454,7 +452,6 @@
         const templatesGrid = document.getElementById("templates-grid");
 
         // 状态变量
-        let ws = null;
         let currentPromptId = null;
         let currentClientId = null;
 
@@ -550,12 +547,15 @@
             appendLog(text);
         }
 
+        // 轮询相关变量
+        let pollInterval = null;
+        
         function resetState() {
             currentPromptId = null;
             currentClientId = null;
-            if (ws) {
-                ws.close();
-                ws = null;
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
             }
         }
 
@@ -599,175 +599,130 @@
             return data;
         }
 
-        // 连接 WebSocket（通过后端代理）
-        let wsTimeoutTimer = null;
-        let hasReceivedMessage = false;
-        
-        function connectWebSocket(clientId, promptId) {
-            // 通过后端代理连接，不直接连接 ComfyUI
-            // 传递promptId以便Scheduler路由到正确的Worker
-            const wsUrl = `${WS_BASE_URL}/ws?clientId=${encodeURIComponent(clientId)}&promptId=${encodeURIComponent(promptId || '')}`;
-            appendLog("连接 WebSocket（通过后端代理）: " + wsUrl);
-            ws = new WebSocket(wsUrl);
-            hasReceivedMessage = false;
-
-            ws.onopen = () => {
-                appendLog("WebSocket 已连接");
-                setStatus("已连接 WebSocket，等待生成进度...");
-                
-                // 设置超时检测：30秒内没有收到任何消息，提示超时
-                wsTimeoutTimer = setTimeout(() => {
-                    if (!hasReceivedMessage) {
-                        setStatus("等待超时：未收到生成进度，请检查任务是否已开始");
-                        appendLog("警告：WebSocket 连接后30秒内未收到任何消息");
-                    }
-                }, 30000);
-            };
-
-            ws.onmessage = (event) => {
-                hasReceivedMessage = true;
-                if (wsTimeoutTimer) {
-                    clearTimeout(wsTimeoutTimer);
-                    wsTimeoutTimer = null;
-                }
-                
-                try {
-                    const data = JSON.parse(event.data);
-                    handleWsMessage(data);
-                } catch (err) {
-                    appendLog("WebSocket 消息解析失败: " + err);
-                }
-            };
-
-            ws.onerror = (event) => {
-                appendLog("WebSocket 错误");
-                console.error(event);
-                setStatus("WebSocket 连接错误，请检查网络连接");
-                if (wsTimeoutTimer) {
-                    clearTimeout(wsTimeoutTimer);
-                    wsTimeoutTimer = null;
-                }
-            };
-
-            ws.onclose = () => {
-                appendLog("WebSocket 已关闭");
-                if (wsTimeoutTimer) {
-                    clearTimeout(wsTimeoutTimer);
-                    wsTimeoutTimer = null;
-                }
-                // 如果关闭时还没有收到完成消息，可能是连接异常
-                if (!hasReceivedMessage) {
-                    setStatus("WebSocket 连接已关闭，任务可能未正常完成");
-                }
-            };
+        // HTTP 轮询获取任务状态
+        function startPollingStatus(promptId) {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+            }
+            
+            appendLog("开始轮询任务状态: " + promptId);
+            setStatus("任务已提交，等待开始...");
+            
+            // 立即查询一次
+            pollStatus(promptId);
+            
+            // 每1.5秒轮询一次
+            pollInterval = setInterval(() => {
+                pollStatus(promptId);
+            }, 1500);
         }
-
-        // 处理 WebSocket 消息
-        function handleWsMessage(data) {
-            const msgType = data?.type;
-            if (!msgType) {
-                appendLog("收到未知 WebSocket 消息：" + JSON.stringify(data));
+        
+        async function pollStatus(promptId) {
+            if (!promptId) {
                 return;
             }
-
-            if (data?.data?.prompt_id && data.data.prompt_id !== currentPromptId) {
-                return;
-            }
-
-            if (msgType === "executing") {
-                const node = data.data?.node;
-                setStatus("执行中... 当前节点: " + (node ?? "unknown"));
-            } else if (msgType === "progress") {
-                const value = data.data?.value;
-                const max = data.data?.max;
-                if (typeof value === "number" && typeof max === "number" && max > 0) {
-                    const percent = ((value / max) * 100).toFixed(1);
-                    setStatus(`执行进度: ${value} / ${max} (${percent}%)`);
-                } else {
-                    appendLog("收到 progress 消息，但数据格式异常: " + JSON.stringify(data));
+            
+            try {
+                const url = `${BACKEND_BASE_URL}/status/${encodeURIComponent(promptId)}`;
+                const resp = await fetch(url);
+                
+                if (!resp.ok) {
+                    if (resp.status === 404) {
+                        appendLog("任务不存在，停止轮询");
+                        stopPolling();
+                        setStatus("任务不存在");
+                        return;
+                    }
+                    throw new Error(`HTTP ${resp.status}`);
                 }
-            } else if (msgType === "executed") {
-                const node = data.data?.node;
-                setStatus("节点已完成: " + (node ?? "unknown"));
-            } else if (msgType === "execution_start") {
-                setStatus("执行开始");
-            } else if (msgType === "execution_complete" || msgType === "execution_success") {
-                setStatus("执行完成，开始获取历史记录 / 图片...");
-                fetchHistoryAndShowImage(currentPromptId).catch((err) => {
-                    console.error(err);
-                    setStatus("获取历史记录或图片失败: " + err.message);
+                
+                const data = await resp.json();
+                const status = data.status;
+                const progress = data.progress || {};
+                
+                // 更新状态显示
+                if (status === "pending") {
+                    setStatus("任务排队中...");
+                } else if (status === "running") {
+                    const value = progress.value || 0;
+                    const max = progress.max || 100;
+                    if (max > 0) {
+                        const percent = ((value / max) * 100).toFixed(1);
+                        setStatus(`执行中: ${value} / ${max} (${percent}%)`);
+                    } else {
+                        setStatus("执行中...");
+                    }
+                } else if (status === "completed") {
+                    // 任务完成，停止轮询，获取结果
+                    stopPolling();
+                    setStatus("任务完成，获取结果...");
+                    fetchResult(promptId);
+                } else if (status === "failed") {
+                    // 任务失败
+                    stopPolling();
+                    const error = data.error || "未知错误";
+                    setStatus("任务失败: " + error);
                     generateBtn.disabled = false;
                     generateText.textContent = "生成图片";
-                });
-            } else {
-                appendLog("收到其他消息类型: " + msgType);
+                }
+            } catch (err) {
+                appendLog("轮询状态失败: " + err.message);
+                // 继续轮询，不中断
+            }
+        }
+        
+        function stopPolling() {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+        }
+        
+        async function fetchResult(promptId) {
+            try {
+                const url = `${BACKEND_BASE_URL}/result/${encodeURIComponent(promptId)}`;
+                const resp = await fetch(url);
+                
+                if (!resp.ok) {
+                    if (resp.status === 400) {
+                        // 任务未完成，继续轮询状态
+                        setStatus("任务尚未完成，继续等待...");
+                        startPollingStatus(promptId);
+                        return;
+                    }
+                    const text = await resp.text();
+                    throw new Error("获取结果失败: " + text);
+                }
+                
+                const data = await resp.json();
+                const imageUrl = data.image_url;
+                
+                if (!imageUrl) {
+                    throw new Error("结果中未包含图片URL");
+                }
+                
+                // 显示图片
+                resultImage.src = imageUrl;
+                resultImage.alt = "生成图片";
+                resultImage.style.display = "block";
+                imageContainer.querySelector(".result-placeholder").style.display = "none";
+                
+                // 显示生成结果区域（带淡入动画）
+                resultContainer.classList.add("show");
+                
+                setStatus("图片生成完成");
+                generateBtn.disabled = false;
+                generateText.textContent = "生成图片";
+                
+                appendLog("图片URL: " + imageUrl);
+            } catch (err) {
+                console.error(err);
+                setStatus("获取结果失败: " + err.message);
+                generateBtn.disabled = false;
+                generateText.textContent = "生成图片";
             }
         }
 
-        // 获取历史记录并显示图片
-        async function fetchHistoryAndShowImage(promptId) {
-            if (!promptId) {
-                throw new Error("prompt_id 为空，无法查询 /history");
-            }
-
-            const url = `${BACKEND_BASE_URL}/history/${encodeURIComponent(promptId)}`;
-            appendLog("请求历史记录: " + url);
-
-            const resp = await fetch(url);
-            if (!resp.ok) {
-                const text = await resp.text();
-                throw new Error("请求 /history 失败: " + text);
-            }
-
-            const data = await resp.json();
-            appendLog("history 响应: " + JSON.stringify(data, null, 2));
-
-            const history = data[promptId];
-            if (!history || !history.outputs) {
-                throw new Error("history 中不包含 outputs，请检查 ComfyUI 配置");
-            }
-
-            let firstImage = null;
-            for (const nodeId in history.outputs) {
-                const output = history.outputs[nodeId];
-                if (!output || !Array.isArray(output.images) || output.images.length === 0) {
-                    continue;
-                }
-                const item = output.images[0];
-                if (item.type === "output" && item.filename) {
-                    firstImage = item;
-                    break;
-                }
-            }
-
-            if (!firstImage) {
-                throw new Error("未在 history.outputs 中找到图片类型的输出");
-            }
-
-            const filename = firstImage.filename;
-            const subfolder = firstImage.subfolder || "";
-            const type = firstImage.type || "output";
-
-            const imageUrl =
-                `${BACKEND_BASE_URL}/image?filename=${encodeURIComponent(filename)}` +
-                `&subfolder=${encodeURIComponent(subfolder)}` +
-                `&type=${encodeURIComponent(type)}`;
-
-            appendLog("图片 URL: " + imageUrl);
-
-            // 显示图片
-            resultImage.src = imageUrl;
-            resultImage.alt = "生成图片";
-            resultImage.style.display = "block";
-            imageContainer.querySelector(".result-placeholder").style.display = "none";
-
-            // 显示生成结果区域（带淡入动画）
-            resultContainer.classList.add("show");
-
-            setStatus("图片生成完成");
-            generateBtn.disabled = false;
-            generateText.textContent = "生成图片";
-        }
 
         // 生成按钮点击事件
         generateBtn.addEventListener("click", async () => {
@@ -800,7 +755,8 @@
                 currentClientId = client_id;
                 appendLog("后端返回 prompt_id=" + prompt_id + ", client_id=" + client_id);
 
-                connectWebSocket(client_id, prompt_id);
+                // 开始轮询任务状态
+                startPollingStatus(prompt_id);
             } catch (err) {
                 console.error(err);
                 // 如果是503错误（没有空闲机器），直接显示错误信息，不加前缀
