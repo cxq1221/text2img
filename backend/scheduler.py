@@ -10,12 +10,10 @@ from pathlib import Path
 try:
     from .worker_manager import WorkerManager
     from .workflow_handler import WorkflowHandler
-    from .comfyui_client import ComfyUIClient
     from .websocket_proxy import WebSocketProxy
 except ImportError:
     from worker_manager import WorkerManager
     from workflow_handler import WorkflowHandler
-    from comfyui_client import ComfyUIClient
     from websocket_proxy import WebSocketProxy
 
 app = FastAPI()
@@ -40,13 +38,10 @@ def index():
 
 # 初始化组件
 WORKFLOW_FILE = Path(__file__).parent / "z-image_base.json"
-COMFYUI_API_URL = "http://127.0.0.1:8188"
-COMFYUI_WS_URL = "ws://127.0.0.1:8188/ws"
 
 worker_manager = WorkerManager(max_task_time=120, heartbeat_timeout=15)
 workflow_handler = WorkflowHandler(WORKFLOW_FILE)
-comfyui_client = ComfyUIClient(COMFYUI_API_URL)
-ws_proxy = WebSocketProxy(COMFYUI_WS_URL)
+ws_proxy = WebSocketProxy()
 
 # 请求模型
 class HeartbeatRequest(BaseModel):
@@ -74,7 +69,7 @@ def complete(req: CompleteRequest):
 
 @app.post("/generate")
 def generate(req: GenerateRequest):
-    """接收prompt，处理workflow，调度到Worker或直接调用ComfyUI"""
+    """接收prompt，处理workflow，调度到Worker"""
     # 读取并处理workflow
     try:
         workflow = workflow_handler.load()
@@ -125,74 +120,49 @@ def generate(req: GenerateRequest):
             print(f"Worker {worker_id} 任务失败，释放Worker: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
     
-    # 有Worker注册但都在忙碌
-    if worker_manager.has_workers():
-        raise HTTPException(status_code=503, detail="当前没有空闲机器，请稍后再试")
-    
-    # 完全没有Worker，直接调用本机ComfyUI
-    try:
-        prompt_id = comfyui_client.submit_prompt(modified_workflow, client_id)
-        # 记录prompt_id映射，使用特殊标记表示本机ComfyUI
-        worker_manager.map_prompt_to_worker(prompt_id, "localhost")
-        
-        return {
-            "prompt_id": prompt_id,
-            "client_id": client_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ComfyUI error: {str(e)}")
+    # 没有可用Worker
+    raise HTTPException(status_code=503, detail="当前没有空闲机器，请稍后再试")
 
 @app.get("/history/{prompt_id}")
 def get_history(prompt_id: str):
-    """转发到Worker或ComfyUI的/history接口"""
+    """转发到Worker的/history接口"""
     worker_id = worker_manager.get_worker_by_prompt(prompt_id)
-    if worker_id and worker_id in worker_manager.workers:
-        worker_info = worker_manager.workers[worker_id]
-        worker_url = worker_info['url']
-        try:
-            response = requests.get(f"{worker_url}/history/{prompt_id}", timeout=5)
-            response.raise_for_status()
-            return JSONResponse(content=response.json())
-        except Exception as e:
-            print(f"Worker {worker_id} 查询历史失败，fallback到本机ComfyUI: {str(e)}")
+    if not worker_id or worker_id not in worker_manager.workers:
+        raise HTTPException(status_code=404, detail="未找到对应的Worker")
     
-    # 没有找到对应的Worker或Worker查询失败，直接调用本机ComfyUI
+    worker_info = worker_manager.workers[worker_id]
+    worker_url = worker_info['url']
     try:
-        data = comfyui_client.get_history(prompt_id)
-        return JSONResponse(content=data)
+        response = requests.get(f"{worker_url}/history/{prompt_id}", timeout=5)
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ComfyUI error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
 
 @app.get("/image")
 def get_image(filename: str, subfolder: str = "", type: str = "output", prompt_id: str = ""):
-    """转发到Worker或ComfyUI的/image接口"""
+    """转发到Worker的/image接口"""
     worker_id = None
     if prompt_id:
         worker_id = worker_manager.get_worker_by_prompt(prompt_id)
     
-    if worker_id and worker_id in worker_manager.workers:
-        worker_info = worker_manager.workers[worker_id]
-        worker_url = worker_info['url']
-        try:
-            params = {"filename": filename, "subfolder": subfolder, "type": type}
-            response = requests.get(f"{worker_url}/image", params=params, stream=True, timeout=5)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "image/png")
-            return StreamingResponse(response.raw, media_type=content_type)
-        except Exception as e:
-            print(f"Worker {worker_id} 查询图像失败，fallback到本机ComfyUI: {str(e)}")
+    if not worker_id or worker_id not in worker_manager.workers:
+        raise HTTPException(status_code=404, detail="未找到对应的Worker")
     
-    # 没有找到对应的Worker或Worker查询失败，直接调用本机ComfyUI
+    worker_info = worker_manager.workers[worker_id]
+    worker_url = worker_info['url']
     try:
-        resp = comfyui_client.get_image(filename, subfolder, type)
-        content_type = resp.headers.get("Content-Type", "image/png")
-        return StreamingResponse(resp.raw, media_type=content_type)
+        params = {"filename": filename, "subfolder": subfolder, "type": type}
+        response = requests.get(f"{worker_url}/image", params=params, stream=True, timeout=5)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "image/png")
+        return StreamingResponse(response.raw, media_type=content_type)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ComfyUI error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
 
 @app.websocket("/ws")
 async def websocket_proxy(websocket: WebSocket):
-    """WebSocket代理，转发到ComfyUI或Worker的ComfyUI"""
+    """WebSocket代理，转发到Worker的ComfyUI"""
     query_params = dict(websocket.query_params)
     client_id = query_params.get("clientId", str(uuid.uuid4()))
     prompt_id = query_params.get("promptId", "")

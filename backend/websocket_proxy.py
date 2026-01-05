@@ -4,10 +4,10 @@ from fastapi import WebSocket, WebSocketDisconnect
 from typing import Optional
 
 class WebSocketProxy:
-    """WebSocket代理，转发到ComfyUI或Worker的ComfyUI"""
+    """WebSocket代理，转发到Worker的ComfyUI"""
     
-    def __init__(self, comfyui_ws_url: str = "ws://127.0.0.1:8188/ws"):
-        self.comfyui_ws_url = comfyui_ws_url
+    def __init__(self):
+        pass
     
     def get_worker_ws_url(self, worker_id: str, client_id: str) -> str:
         """获取Worker的WebSocket URL"""
@@ -19,11 +19,12 @@ class WebSocketProxy:
         """代理WebSocket连接"""
         await websocket.accept()
         
-        # 确定目标WebSocket URL
-        if worker_id and workers and worker_id in workers:
-            comfyui_ws_url = self.get_worker_ws_url(worker_id, client_id)
-        else:
-            comfyui_ws_url = f"{self.comfyui_ws_url}?clientId={client_id}"
+        # 必须有worker_id才能代理
+        if not worker_id or not workers or worker_id not in workers:
+            await websocket.close(code=1008, reason="未找到对应的Worker")
+            return
+        
+        comfyui_ws_url = self.get_worker_ws_url(worker_id, client_id)
         
         comfyui_ws = None
         
