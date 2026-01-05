@@ -7,7 +7,7 @@ import socket
 
 app = FastAPI()
 
-SCHEDULER_URL = "http://localhost:8000"  # 调度中心地址
+SCHEDULER_URL = "http://10.118.237.7:8000"  # 调度中心地址
 HEARTBEAT_INTERVAL = 10  # 心跳间隔（秒）
 COMFYUI_URL = "http://127.0.0.1:8188/prompt"
 
