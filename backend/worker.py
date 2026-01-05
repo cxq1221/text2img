@@ -38,8 +38,10 @@ worker_id = get_worker_id()
 # 任务状态管理：prompt_id -> {status, progress, image_url, error, current_node, message}
 task_status: Dict[str, dict] = {}
 
-# WebSocket 连接管理：prompt_id -> {client_id, ws_task}
-ws_connections: Dict[str, dict] = {}
+# 全局 WebSocket 连接
+global_ws_client_id = str(uuid.uuid4())
+global_ws_task = None
+global_ws_running = False
 
 # 图片存储目录
 IMAGES_DIR = Path(__file__).parent.parent / "images"
@@ -61,114 +63,124 @@ def send_heartbeat():
             pass  # 静默失败，继续重试
         time.sleep(HEARTBEAT_INTERVAL)
 
-async def listen_comfyui_progress(prompt_id: str, client_id: str):
-    """监听 ComfyUI WebSocket 获取详细进度"""
-    ws_url = f"{COMFYUI_WS_URL}?clientId={client_id}"
+async def listen_comfyui_progress():
+    """监听 ComfyUI WebSocket 获取所有任务的详细进度（全局连接）"""
+    global global_ws_running
     
-    try:
-        async with websockets.connect(ws_url) as websocket:
-            print(f"已连接 ComfyUI WebSocket: {prompt_id}, client_id={client_id}")
-            
-            while True:
-                try:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    
-                    msg_type = data.get("type")
-                    
-                    if msg_type == "progress":
-                        # 进度更新
-                        progress_data = data.get("data", {})
-                        value = progress_data.get("value", 0)
-                        max_value = progress_data.get("max", 100)
-                        
-                        if prompt_id in task_status:
-                            task_status[prompt_id]["progress"] = {
-                                "value": value,
-                                "max": max_value
-                            }
-                            task_status[prompt_id]["status"] = "running"
-                    
-                    elif msg_type == "executing":
-                        # 节点执行状态
-                        node_data = data.get("data", {})
-                        node = node_data.get("node")
-                        
-                        if prompt_id in task_status:
-                            if node is None:
-                                # 节点执行完成
-                                task_status[prompt_id]["current_node"] = None
-                            else:
-                                # 正在执行某个节点
-                                task_status[prompt_id]["current_node"] = str(node)
-                                task_status[prompt_id]["status"] = "running"
-                    
-                    elif msg_type == "execution_start":
-                        # 执行开始
-                        if prompt_id in task_status:
-                            task_status[prompt_id]["status"] = "running"
-                            task_status[prompt_id]["message"] = "执行开始"
-                    
-                    elif msg_type == "execution_cached":
-                        # 使用缓存
-                        if prompt_id in task_status:
-                            task_status[prompt_id]["message"] = "使用缓存节点"
-                    
-                    elif msg_type in ["execution_complete", "execution_success"]:
-                        # 执行完成
-                        if prompt_id in task_status:
-                            task_status[prompt_id]["status"] = "completed"
-                            task_status[prompt_id]["progress"] = {"value": 100, "max": 100}
-                            task_status[prompt_id]["message"] = "执行完成"
-                        
-                        # 获取图片
-                        await fetch_and_save_image(prompt_id)
-                        
-                        # 通知scheduler
-                        try:
-                            requests.post(
-                                f"{SCHEDULER_URL}/complete",
-                                json={
-                                    "worker_id": worker_id,
-                                    "prompt_id": prompt_id
-                                },
-                                timeout=2
-                            )
-                            print(f"任务完成，已通知scheduler: prompt_id={prompt_id}")
-                        except Exception as e:
-                            print(f"通知scheduler失败: {e}")
-                        
-                        # 关闭 WebSocket 连接
-                        break
-                    
-                    elif msg_type == "execution_error":
-                        # 执行错误
-                        error_data = data.get("data", {})
-                        error_msg = error_data.get("error", "未知错误")
-                        
-                        if prompt_id in task_status:
-                            task_status[prompt_id]["status"] = "failed"
-                            task_status[prompt_id]["error"] = error_msg
-                            task_status[prompt_id]["failed_at"] = time.time()
-                        
-                        break
+    ws_url = f"{COMFYUI_WS_URL}?clientId={global_ws_client_id}"
+    
+    while True:
+        try:
+            async with websockets.connect(ws_url) as websocket:
+                print(f"已连接 ComfyUI WebSocket (全局连接), client_id={global_ws_client_id}")
+                global_ws_running = True
                 
-                except websockets.exceptions.ConnectionClosed:
-                    print(f"WebSocket 连接已关闭: {prompt_id}")
-                    break
-                except Exception as e:
-                    print(f"处理 WebSocket 消息失败: {e}")
-                    continue
-    
-    except Exception as e:
-        print(f"WebSocket 连接失败: {prompt_id}, {e}")
-        if prompt_id in task_status:
-            task_status[prompt_id]["status"] = "failed"
-            task_status[prompt_id]["error"] = f"WebSocket连接失败: {str(e)}"
-    finally:
-        # 清理连接
-        if prompt_id in ws_connections:
-            del ws_connections[prompt_id]
+                while True:
+                    try:
+                        message = await websocket.recv()
+                        data = json.loads(message)
+                        
+                        msg_type = data.get("type")
+                        msg_data = data.get("data", {})
+                        
+                        # 根据消息类型提取 prompt_id
+                        prompt_id = None
+                        if msg_type in ["execution_start", "execution_complete", "execution_success", "execution_cached", "execution_error"]:
+                            # 这些消息类型直接包含 prompt_id
+                            prompt_id = msg_data.get("prompt_id")
+                            if prompt_id:
+                                print(f"[WebSocket] 收到 {msg_type} 消息, prompt_id={prompt_id}")
+                        elif msg_type in ["progress", "executing"]:
+                            # progress 和 executing 消息可能没有 prompt_id，需要从当前执行的任务推断
+                            # 查找状态为 running 或 pending 的任务（通常只有一个）
+                            for pid, status_info in task_status.items():
+                                if status_info.get("status") in ["running", "pending"]:
+                                    prompt_id = pid
+                                    break
+                        
+                        if msg_type == "progress":
+                            # 进度更新
+                            progress_data = msg_data
+                            value = progress_data.get("value", 0)
+                            max_value = progress_data.get("max", 100)
+                            
+                            if prompt_id and prompt_id in task_status:
+                                task_status[prompt_id]["progress"] = {
+                                    "value": value,
+                                    "max": max_value
+                                }
+                                task_status[prompt_id]["status"] = "running"
+                        
+                        elif msg_type == "executing":
+                            # 节点执行状态
+                            node = msg_data.get("node")
+                            
+                            if prompt_id and prompt_id in task_status:
+                                if node is None:
+                                    # 节点执行完成
+                                    task_status[prompt_id]["current_node"] = None
+                                else:
+                                    # 正在执行某个节点
+                                    task_status[prompt_id]["current_node"] = str(node)
+                                    task_status[prompt_id]["status"] = "running"
+                        
+                        elif msg_type == "execution_start":
+                            # 执行开始
+                            if prompt_id and prompt_id in task_status:
+                                task_status[prompt_id]["status"] = "running"
+                                task_status[prompt_id]["message"] = "执行开始"
+                        
+                        elif msg_type == "execution_cached":
+                            # 使用缓存
+                            if prompt_id and prompt_id in task_status:
+                                task_status[prompt_id]["message"] = "使用缓存节点"
+                        
+                        elif msg_type in ["execution_complete", "execution_success"]:
+                            # 执行完成
+                            if prompt_id and prompt_id in task_status:
+                                task_status[prompt_id]["status"] = "completed"
+                                task_status[prompt_id]["progress"] = {"value": 100, "max": 100}
+                                task_status[prompt_id]["message"] = "执行完成"
+                                
+                                # 获取图片
+                                await fetch_and_save_image(prompt_id)
+                                
+                                # 通知scheduler
+                                try:
+                                    requests.post(
+                                        f"{SCHEDULER_URL}/complete",
+                                        json={
+                                            "worker_id": worker_id,
+                                            "prompt_id": prompt_id
+                                        },
+                                        timeout=2
+                                    )
+                                    print(f"任务完成，已通知scheduler: prompt_id={prompt_id}")
+                                except Exception as e:
+                                    print(f"通知scheduler失败: {e}")
+                        
+                        elif msg_type == "execution_error":
+                            # 执行错误
+                            error_msg = msg_data.get("error", "未知错误")
+                            
+                            if prompt_id and prompt_id in task_status:
+                                task_status[prompt_id]["status"] = "failed"
+                                task_status[prompt_id]["error"] = error_msg
+                                task_status[prompt_id]["failed_at"] = time.time()
+                    
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"WebSocket 连接已关闭，5秒后重连...")
+                        global_ws_running = False
+                        await asyncio.sleep(5)  # 等待5秒后重连
+                        break
+                    except Exception as e:
+                        print(f"处理 WebSocket 消息失败: {e}")
+                        continue
+        
+        except Exception as e:
+            print(f"WebSocket 连接失败，5秒后重连: {e}")
+            global_ws_running = False
+            await asyncio.sleep(5)  # 等待5秒后重连
 
 async def fetch_and_save_image(prompt_id: str):
     """获取并保存图片"""
@@ -233,12 +245,12 @@ async def fetch_and_save_image(prompt_id: str):
     except Exception as e:
         print(f"获取图片失败: {e}")
 
-def start_websocket_listener(prompt_id: str, client_id: str):
-    """启动 WebSocket 监听线程"""
+def start_global_websocket_listener():
+    """启动全局 WebSocket 监听线程（启动时调用一次）"""
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(listen_comfyui_progress(prompt_id, client_id))
+        loop.run_until_complete(listen_comfyui_progress())
         loop.close()
     
     thread = threading.Thread(target=run, daemon=True)
@@ -250,6 +262,11 @@ def run(payload: dict):
     """接收任务，转发到ComfyUI"""
     try:
         print(f"Worker收到任务，转发到ComfyUI: {COMFYUI_URL}")
+        
+        # 使用全局 WebSocket 的 client_id，确保能收到消息
+        payload["client_id"] = global_ws_client_id
+        print(f"使用全局 WebSocket client_id: {global_ws_client_id}")
+        
         response = requests.post(COMFYUI_URL, json=payload, timeout=10)
         response.raise_for_status()
         result = response.json()
@@ -273,14 +290,7 @@ def run(payload: dict):
             "created_at": time.time()
         }
         
-        # 启动 WebSocket 监听获取详细进度
-        client_id = payload.get("client_id", str(uuid.uuid4()))
-        ws_connections[prompt_id] = {
-            "client_id": client_id,
-            "thread": start_websocket_listener(prompt_id, client_id)
-        }
-        
-        print(f"开始执行任务: prompt_id={prompt_id}, client_id={client_id}")
+        print(f"开始执行任务: prompt_id={prompt_id}, 使用全局WebSocket client_id={global_ws_client_id}")
         return result
     except HTTPException:
         raise
@@ -315,6 +325,10 @@ def get_result(prompt_id: str):
     }
 
 if __name__ == "__main__":
+    # 启动全局 WebSocket 监听（启动时建立连接，一直保持）
+    global_ws_task = start_global_websocket_listener()
+    print("已启动全局 WebSocket 监听线程")
+    
     # 启动心跳线程
     heartbeat_thread = threading.Thread(target=send_heartbeat, daemon=True)
     heartbeat_thread.start()

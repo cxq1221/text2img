@@ -4,3 +4,4 @@ WebSocket代理配置说明.md
 install_service.sh
 start_service.sh
 text2img-demo.service
+images/*.png
