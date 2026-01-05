@@ -6,6 +6,10 @@ import time
 import threading
 import socket
 import shutil
+import websockets
+import asyncio
+import json
+import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -15,6 +19,7 @@ SCHEDULER_URL = "http://10.118.237.7:8000"  # 调度中心地址
 HEARTBEAT_INTERVAL = 10  # 心跳间隔（秒）
 COMFYUI_URL = "http://127.0.0.1:8188/prompt"
 COMFYUI_BASE = "http://127.0.0.1:8188"
+COMFYUI_WS_URL = "ws://127.0.0.1:8188/ws"
 
 # 获取本机IP作为worker_id
 def get_worker_id():
@@ -30,8 +35,11 @@ def get_worker_id():
 
 worker_id = get_worker_id()
 
-# 任务状态管理：prompt_id -> {status, progress, image_url, error}
+# 任务状态管理：prompt_id -> {status, progress, image_url, error, current_node, message}
 task_status: Dict[str, dict] = {}
+
+# WebSocket 连接管理：prompt_id -> {client_id, ws_task}
+ws_connections: Dict[str, dict] = {}
 
 # 图片存储目录
 IMAGES_DIR = Path(__file__).parent.parent / "images"
@@ -53,116 +61,189 @@ def send_heartbeat():
             pass  # 静默失败，继续重试
         time.sleep(HEARTBEAT_INTERVAL)
 
-def check_task_complete():
-    """定期检查任务状态和进度"""
-    while True:
-        # 检查所有正在执行的任务
-        for prompt_id in list(task_status.keys()):
-            status_info = task_status.get(prompt_id)
-            if not status_info:
-                continue
+async def listen_comfyui_progress(prompt_id: str, client_id: str):
+    """监听 ComfyUI WebSocket 获取详细进度"""
+    ws_url = f"{COMFYUI_WS_URL}?clientId={client_id}"
+    
+    try:
+        async with websockets.connect(ws_url) as websocket:
+            print(f"已连接 ComfyUI WebSocket: {prompt_id}, client_id={client_id}")
             
-            if status_info.get("status") in ["completed", "failed"]:
-                continue  # 已完成的任务跳过
-            
-            try:
-                # 获取任务历史
-                response = requests.get(f"{COMFYUI_BASE}/history/{prompt_id}", timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    if prompt_id in data:
-                        task_info = data[prompt_id]
-                        status = task_info.get("status", {})
+            while True:
+                try:
+                    message = await websocket.recv()
+                    data = json.loads(message)
+                    
+                    msg_type = data.get("type")
+                    
+                    if msg_type == "progress":
+                        # 进度更新
+                        progress_data = data.get("data", {})
+                        value = progress_data.get("value", 0)
+                        max_value = progress_data.get("max", 100)
                         
-                        # 更新进度信息
-                        queue_remaining = status.get("queue_remaining", 0)
-                        if queue_remaining == 0:
-                            # 任务正在执行或已完成
-                            if status.get("completed", False):
-                                # 如果已经完成过，跳过
-                                if task_status[prompt_id].get("status") == "completed":
-                                    continue
-                                
-                                # 任务完成，获取图片信息
-                                outputs = task_info.get("outputs", {})
-                                image_url = None
-                                
-                                # 查找图片输出
-                                for node_id, output in outputs.items():
-                                    if output and "images" in output:
-                                        images = output["images"]
-                                        if images and len(images) > 0:
-                                            img_info = images[0]
-                                            filename = img_info.get("filename")
-                                            subfolder = img_info.get("subfolder", "")
-                                            img_type = img_info.get("type", "output")
-                                            
-                                            if filename:
-                                                # 从ComfyUI获取图片并保存到本地
-                                                try:
-                                                    img_params = {
-                                                        "filename": filename,
-                                                        "subfolder": subfolder,
-                                                        "type": img_type
-                                                    }
-                                                    img_response = requests.get(
-                                                        f"{COMFYUI_BASE}/view",
-                                                        params=img_params,
-                                                        stream=True,
-                                                        timeout=10
-                                                    )
-                                                    if img_response.status_code == 200:
-                                                        # 保存图片到本地
-                                                        local_filename = f"{prompt_id}_{filename}"
-                                                        local_path = IMAGES_DIR / local_filename
-                                                        with open(local_path, "wb") as f:
-                                                            shutil.copyfileobj(img_response.raw, f)
-                                                        
-                                                        # 生成可访问的URL
-                                                        image_url = f"http://{worker_id}:8001/images/{local_filename}"
-                                                        print(f"图片已保存: {local_path}, URL: {image_url}")
-                                                except Exception as e:
-                                                    print(f"保存图片失败: {e}")
-                                                
-                                                break
-                                
-                                # 更新任务状态为完成
-                                task_status[prompt_id] = {
-                                    "status": "completed",
-                                    "progress": {"value": 100, "max": 100},
-                                    "image_url": image_url,
-                                    "completed_at": time.time()
-                                }
-                                
-                                # 通知scheduler
-                                try:
-                                    requests.post(
-                                        f"{SCHEDULER_URL}/complete",
-                                        json={
-                                            "worker_id": worker_id,
-                                            "prompt_id": prompt_id
-                                        },
-                                        timeout=2
-                                    )
-                                    print(f"任务完成，已通知scheduler: prompt_id={prompt_id}")
-                                except Exception as e:
-                                    print(f"通知scheduler失败: {e}")
+                        if prompt_id in task_status:
+                            task_status[prompt_id]["progress"] = {
+                                "value": value,
+                                "max": max_value
+                            }
+                            task_status[prompt_id]["status"] = "running"
+                    
+                    elif msg_type == "executing":
+                        # 节点执行状态
+                        node_data = data.get("data", {})
+                        node = node_data.get("node")
+                        
+                        if prompt_id in task_status:
+                            if node is None:
+                                # 节点执行完成
+                                task_status[prompt_id]["current_node"] = None
                             else:
-                                # 任务执行中，更新状态
+                                # 正在执行某个节点
+                                task_status[prompt_id]["current_node"] = str(node)
                                 task_status[prompt_id]["status"] = "running"
-                        else:
-                            # 任务在队列中
-                            task_status[prompt_id]["status"] = "pending"
-                            task_status[prompt_id]["progress"] = {"value": 0, "max": 100}
-            except Exception as e:
-                # 检查失败，标记为错误
-                task_status[prompt_id] = {
-                    "status": "failed",
-                    "error": str(e),
-                    "failed_at": time.time()
-                }
+                    
+                    elif msg_type == "execution_start":
+                        # 执行开始
+                        if prompt_id in task_status:
+                            task_status[prompt_id]["status"] = "running"
+                            task_status[prompt_id]["message"] = "执行开始"
+                    
+                    elif msg_type == "execution_cached":
+                        # 使用缓存
+                        if prompt_id in task_status:
+                            task_status[prompt_id]["message"] = "使用缓存节点"
+                    
+                    elif msg_type in ["execution_complete", "execution_success"]:
+                        # 执行完成
+                        if prompt_id in task_status:
+                            task_status[prompt_id]["status"] = "completed"
+                            task_status[prompt_id]["progress"] = {"value": 100, "max": 100}
+                            task_status[prompt_id]["message"] = "执行完成"
+                        
+                        # 获取图片
+                        await fetch_and_save_image(prompt_id)
+                        
+                        # 通知scheduler
+                        try:
+                            requests.post(
+                                f"{SCHEDULER_URL}/complete",
+                                json={
+                                    "worker_id": worker_id,
+                                    "prompt_id": prompt_id
+                                },
+                                timeout=2
+                            )
+                            print(f"任务完成，已通知scheduler: prompt_id={prompt_id}")
+                        except Exception as e:
+                            print(f"通知scheduler失败: {e}")
+                        
+                        # 关闭 WebSocket 连接
+                        break
+                    
+                    elif msg_type == "execution_error":
+                        # 执行错误
+                        error_data = data.get("data", {})
+                        error_msg = error_data.get("error", "未知错误")
+                        
+                        if prompt_id in task_status:
+                            task_status[prompt_id]["status"] = "failed"
+                            task_status[prompt_id]["error"] = error_msg
+                            task_status[prompt_id]["failed_at"] = time.time()
+                        
+                        break
+                
+                except websockets.exceptions.ConnectionClosed:
+                    print(f"WebSocket 连接已关闭: {prompt_id}")
+                    break
+                except Exception as e:
+                    print(f"处理 WebSocket 消息失败: {e}")
+                    continue
+    
+    except Exception as e:
+        print(f"WebSocket 连接失败: {prompt_id}, {e}")
+        if prompt_id in task_status:
+            task_status[prompt_id]["status"] = "failed"
+            task_status[prompt_id]["error"] = f"WebSocket连接失败: {str(e)}"
+    finally:
+        # 清理连接
+        if prompt_id in ws_connections:
+            del ws_connections[prompt_id]
+
+async def fetch_and_save_image(prompt_id: str):
+    """获取并保存图片"""
+    try:
+        # 获取任务历史
+        response = requests.get(f"{COMFYUI_BASE}/history/{prompt_id}", timeout=5)
+        if response.status_code != 200:
+            return
         
-        time.sleep(2)  # 每2秒检查一次
+        data = response.json()
+        if prompt_id not in data:
+            return
+        
+        task_info = data[prompt_id]
+        outputs = task_info.get("outputs", {})
+        image_url = None
+        
+        # 查找图片输出
+        for node_id, output in outputs.items():
+            if output and "images" in output:
+                images = output["images"]
+                if images and len(images) > 0:
+                    img_info = images[0]
+                    filename = img_info.get("filename")
+                    subfolder = img_info.get("subfolder", "")
+                    img_type = img_info.get("type", "output")
+                    
+                    if filename:
+                        # 从ComfyUI获取图片并保存到本地
+                        try:
+                            img_params = {
+                                "filename": filename,
+                                "subfolder": subfolder,
+                                "type": img_type
+                            }
+                            img_response = requests.get(
+                                f"{COMFYUI_BASE}/view",
+                                params=img_params,
+                                stream=True,
+                                timeout=10
+                            )
+                            if img_response.status_code == 200:
+                                # 保存图片到本地
+                                local_filename = f"{prompt_id}_{filename}"
+                                local_path = IMAGES_DIR / local_filename
+                                with open(local_path, "wb") as f:
+                                    shutil.copyfileobj(img_response.raw, f)
+                                
+                                # 生成可访问的URL
+                                image_url = f"http://{worker_id}:8001/images/{local_filename}"
+                                print(f"图片已保存: {local_path}, URL: {image_url}")
+                        except Exception as e:
+                            print(f"保存图片失败: {e}")
+                        
+                        break
+        
+        # 更新任务状态
+        if prompt_id in task_status:
+            task_status[prompt_id]["image_url"] = image_url
+            task_status[prompt_id]["completed_at"] = time.time()
+    
+    except Exception as e:
+        print(f"获取图片失败: {e}")
+
+def start_websocket_listener(prompt_id: str, client_id: str):
+    """启动 WebSocket 监听线程"""
+    def run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(listen_comfyui_progress(prompt_id, client_id))
+        loop.close()
+    
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 @app.post("/run")
 def run(payload: dict):
@@ -187,10 +268,19 @@ def run(payload: dict):
             "status": "pending",
             "progress": {"value": 0, "max": 100},
             "image_url": None,
+            "current_node": None,
+            "message": "任务已提交，等待执行",
             "created_at": time.time()
         }
         
-        print(f"开始执行任务: prompt_id={prompt_id}")
+        # 启动 WebSocket 监听获取详细进度
+        client_id = payload.get("client_id", str(uuid.uuid4()))
+        ws_connections[prompt_id] = {
+            "client_id": client_id,
+            "thread": start_websocket_listener(prompt_id, client_id)
+        }
+        
+        print(f"开始执行任务: prompt_id={prompt_id}, client_id={client_id}")
         return result
     except HTTPException:
         raise
@@ -228,10 +318,6 @@ if __name__ == "__main__":
     # 启动心跳线程
     heartbeat_thread = threading.Thread(target=send_heartbeat, daemon=True)
     heartbeat_thread.start()
-    
-    # 启动任务完成检查线程
-    check_thread = threading.Thread(target=check_task_complete, daemon=True)
-    check_thread.start()
     
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)

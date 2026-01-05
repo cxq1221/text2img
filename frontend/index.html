@@ -639,19 +639,36 @@
                 const data = await resp.json();
                 const status = data.status;
                 const progress = data.progress || {};
+                const current_node = data.current_node;
+                const message = data.message;
                 
                 // 更新状态显示
                 if (status === "pending") {
-                    setStatus("任务排队中...");
+                    const displayMsg = message || "任务排队中...";
+                    setStatus(displayMsg);
                 } else if (status === "running") {
                     const value = progress.value || 0;
                     const max = progress.max || 100;
-                    if (max > 0) {
+                    let statusText = "";
+                    
+                    if (max > 0 && value > 0) {
                         const percent = ((value / max) * 100).toFixed(1);
-                        setStatus(`执行中: ${value} / ${max} (${percent}%)`);
+                        statusText = `执行中: ${value} / ${max} (${percent}%)`;
                     } else {
-                        setStatus("执行中...");
+                        statusText = "执行中...";
                     }
+                    
+                    // 添加当前节点信息
+                    if (current_node) {
+                        statusText += ` - 节点: ${current_node}`;
+                    }
+                    
+                    // 添加消息信息
+                    if (message) {
+                        statusText += ` - ${message}`;
+                    }
+                    
+                    setStatus(statusText);
                 } else if (status === "completed") {
                     // 任务完成，停止轮询，获取结果
                     stopPolling();
