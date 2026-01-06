@@ -138,26 +138,38 @@ async def listen_comfyui_progress():
                         elif msg_type in ["execution_complete", "execution_success"]:
                             # 执行完成
                             if prompt_id and prompt_id in task_status:
-                                task_status[prompt_id]["status"] = "completed"
+                                # 先更新进度和消息，但状态保持为 running，等待图片保存成功
                                 task_status[prompt_id]["progress"] = {"value": 100, "max": 100}
-                                task_status[prompt_id]["message"] = "执行完成"
+                                task_status[prompt_id]["message"] = "执行完成，正在保存图片..."
+                                task_status[prompt_id]["status"] = "running"  # 保持 running，等待图片保存
                                 
-                                # 获取图片
-                                await fetch_and_save_image(prompt_id)
+                                # 获取并保存图片（必须成功）
+                                image_saved = await fetch_and_save_image(prompt_id)
                                 
-                                # 通知scheduler
-                                try:
-                                    requests.post(
-                                        f"{SCHEDULER_URL}/complete",
-                                        json={
-                                            "worker_id": worker_id,
-                                            "prompt_id": prompt_id
-                                        },
-                                        timeout=2
-                                    )
-                                    print(f"任务完成，已通知scheduler: prompt_id={prompt_id}")
-                                except Exception as e:
-                                    print(f"通知scheduler失败: {e}")
+                                # 只有图片保存成功，才标记为 completed
+                                if image_saved and task_status[prompt_id].get("image_url"):
+                                    task_status[prompt_id]["status"] = "completed"
+                                    task_status[prompt_id]["message"] = "执行完成"
+                                    
+                                    # 通知scheduler
+                                    try:
+                                        requests.post(
+                                            f"{SCHEDULER_URL}/complete",
+                                            json={
+                                                "worker_id": worker_id,
+                                                "prompt_id": prompt_id
+                                            },
+                                            timeout=2
+                                        )
+                                        print(f"任务完成，已通知scheduler: prompt_id={prompt_id}, image_url={task_status[prompt_id].get('image_url')}")
+                                    except Exception as e:
+                                        print(f"通知scheduler失败: {e}")
+                                else:
+                                    # 图片保存失败，标记为失败
+                                    task_status[prompt_id]["status"] = "failed"
+                                    task_status[prompt_id]["error"] = "图片保存失败，无法获取生成的图片"
+                                    task_status[prompt_id]["failed_at"] = time.time()
+                                    print(f"任务失败（图片保存失败）: prompt_id={prompt_id}")
                         
                         elif msg_type == "execution_error":
                             # 执行错误
@@ -182,17 +194,30 @@ async def listen_comfyui_progress():
             global_ws_running = False
             await asyncio.sleep(5)  # 等待5秒后重连
 
-async def fetch_and_save_image(prompt_id: str):
-    """获取并保存图片"""
+async def fetch_and_save_image(prompt_id: str) -> bool:
+    """获取并保存图片，返回是否成功"""
     try:
-        # 获取任务历史
-        response = requests.get(f"{COMFYUI_BASE}/history/{prompt_id}", timeout=5)
-        if response.status_code != 200:
-            return
+        # 获取任务历史（可能需要重试，因为ComfyUI可能还在写入）
+        max_retries = 3
+        retry_delay = 1
+        data = None
         
-        data = response.json()
-        if prompt_id not in data:
-            return
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(f"{COMFYUI_BASE}/history/{prompt_id}", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    if prompt_id in data:
+                        break
+            except Exception as e:
+                print(f"获取历史失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+        
+        if not data or prompt_id not in data:
+            print(f"无法获取任务历史: prompt_id={prompt_id}")
+            return False
         
         task_info = data[prompt_id]
         outputs = task_info.get("outputs", {})
@@ -229,21 +254,37 @@ async def fetch_and_save_image(prompt_id: str):
                                 with open(local_path, "wb") as f:
                                     shutil.copyfileobj(img_response.raw, f)
                                 
-                                # 生成可访问的URL
-                                image_url = f"http://{worker_id}:8001/images/{local_filename}"
-                                print(f"图片已保存: {local_path}, URL: {image_url}")
+                                # 验证文件是否成功保存
+                                if local_path.exists() and local_path.stat().st_size > 0:
+                                    # 生成可访问的URL
+                                    image_url = f"http://{worker_id}:8001/images/{local_filename}"
+                                    print(f"图片已保存: {local_path}, URL: {image_url}")
+                                else:
+                                    print(f"图片文件保存失败或文件为空: {local_path}")
+                                    return False
+                            else:
+                                print(f"从ComfyUI获取图片失败: HTTP {img_response.status_code}")
+                                return False
                         except Exception as e:
                             print(f"保存图片失败: {e}")
+                            return False
                         
                         break
+        
+        if not image_url:
+            print(f"未找到图片输出: prompt_id={prompt_id}")
+            return False
         
         # 更新任务状态
         if prompt_id in task_status:
             task_status[prompt_id]["image_url"] = image_url
             task_status[prompt_id]["completed_at"] = time.time()
+        
+        return True
     
     except Exception as e:
         print(f"获取图片失败: {e}")
+        return False
 
 def start_global_websocket_listener():
     """启动全局 WebSocket 监听线程（启动时调用一次）"""
