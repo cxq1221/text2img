@@ -25,14 +25,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 前端托管
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+# 前端托管（生产环境建议先在 frontend 目录执行 `npm run build`）
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+    # html=True 使得直接访问目录时返回 index.html，便于前端路由
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=True), name="static")
 
 @app.get("/", include_in_schema=False)
 def index():
-    return RedirectResponse(url="/static/index.html")
+    """
+    根路径重定向到前端静态资源。
+    访问 http://host:8000/ 即可打开打包后的前端。
+    """
+    if FRONTEND_DIR.exists():
+        return RedirectResponse(url="/static")
+    # 如果还没构建前端，给出简单提示
+    return JSONResponse(
+        status_code=200,
+        content={"message": "前端尚未构建，请在 frontend 目录执行 `npm run build` 后重试。"},
+    )
 
 # 初始化组件
 WORKFLOW_FILE = Path(__file__).parent / "z-image_base.json"
