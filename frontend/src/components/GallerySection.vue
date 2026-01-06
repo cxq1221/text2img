@@ -29,6 +29,7 @@
           class="gallery-card"
           v-for="item in worksToShow"
           :key="item.id"
+          @click="handleCardClick(item)"
         >
           <img :src="item.cover" :alt="item.title" />
           <div class="gallery-card-footer">
@@ -46,7 +47,7 @@
 </template>
 
 <script setup>
-defineProps({
+const props = defineProps({
   activeWorksTab: {
     type: String,
     required: true
@@ -57,7 +58,14 @@ defineProps({
   }
 });
 
-defineEmits(["update:activeWorksTab"]);
+const emit = defineEmits(["update:activeWorksTab", "use-prompt"]);
+
+function handleCardClick(item) {
+  // 如果模板有 prompt 字段，触发事件将 prompt 填入输入框
+  if (item.prompt) {
+    emit("use-prompt", item.prompt);
+  }
+}
 </script>
 
 

@@ -4,7 +4,7 @@
 
     <!-- 右侧主区域 -->
     <main class="main">
-      <Topbar v-model:topSearch="topSearch" />
+      <!-- <Topbar v-model:topSearch="topSearch" /> -->
 
       <section class="page-content">
         <HeroHeader />
@@ -32,6 +32,7 @@
           :active-works-tab="activeWorksTab"
           :works-to-show="worksToShow"
           @update:activeWorksTab="value => (activeWorksTab = value)"
+          @use-prompt="handleUsePrompt"
         />
       </section>
     </main>
@@ -89,7 +90,9 @@ const state = reactive({
       type: "image",
       tag: "IMAGE",
       cover:
-        "https://images.pexels.com/photos/2253275/pexels-photo-2253275.jpeg?auto=compress&cs=tinysrgb&w=600"
+        "https://images.pexels.com/photos/2253275/pexels-photo-2253275.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "一只可爱的金毛幼犬在春日的绿色草地上欢快地奔跑，阳光透过云层洒下温暖的光芒，草地上点缀着黄色和白色的小野花，背景是远山和蓝天白云，画面充满生机与活力，电影级别的景深效果，柔和的光影，高清晰度，细节丰富，色彩饱和自然，温馨治愈的氛围"
     },
     {
       id: "p2",
@@ -97,7 +100,9 @@ const state = reactive({
       type: "image",
       tag: "IMAGE",
       cover:
-        "https://images.pexels.com/photos/3404200/pexels-photo-3404200.jpeg?auto=compress&cs=tinysrgb&w=600"
+        "https://images.pexels.com/photos/3404200/pexels-photo-3404200.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "未来主义赛博朋克风格的都市夜景，高耸入云的摩天大楼群，霓虹灯在夜色中闪烁，紫色、粉色、蓝色的霓虹光效交织，街道上有飞行汽车穿梭，雨后的地面反射着霓虹灯光，营造出科技感与神秘感并存的氛围，电影级别的构图，强烈的对比度，细节精致，充满未来科技感，赛博朋克美学，高清晰度"
     },
     {
       id: "p3",
@@ -105,7 +110,9 @@ const state = reactive({
       type: "image",
       tag: "IMAGE",
       cover:
-        "https://images.pexels.com/photos/2837009/pexels-photo-2837009.jpeg?auto=compress&cs=tinysrgb&w=600"
+        "https://images.pexels.com/photos/2837009/pexels-photo-2837009.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "抽象的流体艺术画面，蓝色和青色的液体在画面中流动，形成优雅的曲线和漩涡，渐变色彩从深蓝过渡到浅蓝再到青色，光影在液体表面反射，创造出梦幻般的光泽效果，画面充满动感与韵律，抽象艺术风格，高清晰度，细节丰富，色彩饱和，现代艺术感，适合作为背景或装饰画"
     },
     {
       id: "v1",
@@ -113,7 +120,9 @@ const state = reactive({
       type: "video",
       tag: "VIDEO",
       cover:
-        "https://images.pexels.com/photos/2832058/pexels-photo-2832058.jpeg?auto=compress&cs=tinysrgb&w=600"
+        "https://images.pexels.com/photos/2832058/pexels-photo-2832058.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "浩瀚的宇宙星空背景，无数闪烁的星星和星云，粒子效果在画面中流动，形成光带和光点，深蓝色的宇宙空间，远处有星系的轮廓，画面充满神秘感和科幻感，电影级别的视觉效果，高清晰度，细节精致，色彩丰富，适合作为视频背景或特效素材"
     },
     {
       id: "v2",
@@ -121,7 +130,9 @@ const state = reactive({
       type: "video",
       tag: "VIDEO",
       cover:
-        "https://images.pexels.com/photos/2580834/pexels-photo-2580834.jpeg?auto=compress&cs=tinysrgb&w=600"
+        "https://images.pexels.com/photos/2580834/pexels-photo-2580834.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "科技感十足的光效循环动画，蓝色和紫色的光线在黑色背景中流动，形成几何图形和光带，光线有渐变效果，从亮到暗，营造出未来科技的氛围，画面简洁现代，适合作为科技产品的背景或UI界面元素，高清晰度，细节精致，色彩饱和"
     },
     {
       id: "p4",
@@ -129,7 +140,39 @@ const state = reactive({
       type: "image",
       tag: "IMAGE",
       cover:
-        "https://images.pexels.com/photos/2680270/pexels-photo-2680270.jpeg?auto=compress&cs=tinysrgb&w=600"
+        "https://images.pexels.com/photos/2680270/pexels-photo-2680270.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "梦幻的渐变纹理画面，色彩从粉色过渡到紫色再到蓝色，形成柔和的渐变效果，纹理细腻，有丝绸般的质感，光影在纹理表面流动，创造出梦幻般的光泽，画面充满艺术感和装饰性，适合作为背景或设计素材，高清晰度，细节丰富，色彩饱和自然，现代艺术风格"
+    },
+    {
+      id: "p5",
+      title: "日式庭院禅意",
+      type: "image",
+      tag: "IMAGE",
+      cover:
+        "https://images.pexels.com/photos/2693212/pexels-photo-2693212.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "宁静的日式传统庭院，石灯笼在黄昏时分点亮，温暖的灯光洒在青石小径上，庭院中有精心修剪的松树和竹子，远处有假山和流水，池塘中倒映着天空和树木，画面充满禅意和宁静的氛围，电影级别的构图，柔和的光影，高清晰度，细节精致，色彩自然，东方美学，适合作为冥想或放松的背景"
+    },
+    {
+      id: "p6",
+      title: "蒸汽朋克机械城",
+      type: "image",
+      tag: "IMAGE",
+      cover:
+        "https://images.pexels.com/photos/2253275/pexels-photo-2253275.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "蒸汽朋克风格的机械城市，巨大的齿轮和管道在画面中交错，铜色的金属表面反射着暖黄色的灯光，蒸汽从管道中喷出，营造出工业革命的氛围，建筑风格融合了维多利亚时代和未来科技，画面充满细节和质感，电影级别的视觉效果，高清晰度，色彩饱和，细节丰富，适合作为游戏场景或概念艺术"
+    },
+    {
+      id: "p7",
+      title: "极光下的雪山",
+      type: "image",
+      tag: "IMAGE",
+      cover:
+        "https://images.pexels.com/photos/3404200/pexels-photo-3404200.jpeg?auto=compress&cs=tinysrgb&w=600",
+      prompt:
+        "壮观的极光在夜空中舞动，绿色的光带在深蓝色的天空中闪烁，下方是覆盖着白雪的山峰，月光洒在山顶上，形成银白色的光辉，画面充满神秘感和自然之美，电影级别的构图，高清晰度，细节精致，色彩丰富，适合作为壁纸或风景摄影作品，自然风光，极地景观"
     }
   ],
   myWorks: []
@@ -344,6 +387,23 @@ async function fetchResult(promptId) {
   }
 }
 
+function handleUsePrompt(promptText) {
+  // 将模板的提示词填入输入框
+  state.prompt = promptText;
+  // 切换到文生图标签（如果当前在图生图）
+  if (state.activeTab === "img2img") {
+    state.activeTab = "text2img";
+  }
+  // 滚动到输入框位置，方便用户查看和编辑
+  setTimeout(() => {
+    const textarea = document.querySelector(".prompt-textarea");
+    if (textarea) {
+      textarea.focus();
+      textarea.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, 100);
+}
+
 async function onGenerate() {
   if (!state.prompt.trim()) {
     state.frontendTip = "请先输入提示词。";
@@ -410,11 +470,6 @@ onUnmounted(() => {
   box-sizing: border-box;
 }
 
-html,
-body {
-  height: 100%;
-}
-
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -424,7 +479,7 @@ body {
 
 .app-shell {
   display: flex;
-  height: 100vh;
+  min-height: 100vh;
   background: radial-gradient(circle at top left, #e0f2ff 0, #f3f6fb 40%, #f3f6fb 100%);
 }
 
@@ -662,7 +717,6 @@ body {
   border-radius: 16px;
   padding: 20px 22px;
   box-shadow: 0 10px 40px rgba(15, 23, 42, 0.04);
-  overflow: hidden;
 }
 
 .hero-header {
